@@ -186,8 +186,9 @@ class ThemeDownloader(private val context: Context) {
                 status = DownloadStatus.DOWNLOADING,
                 errorMessage = null
             ))
-            
-            val themeSuccess = downloadFileWithRetry(
+
+            // 1. 下载主题文件（致命：失败则整体失败）
+            val themeResult = downloadFileWithRetry(
                 url = theme.downloadUrl,
                 file = themeFile,
                 taskId = taskId,
@@ -197,13 +198,13 @@ class ThemeDownloader(private val context: Context) {
                 val overall = fileProgress * 0.7f
                 updateProgress(taskId, fileProgress, 0f, overall, DownloadStatus.DOWNLOADING, null)
             }
-            
-            if (!themeSuccess) {
-                updateProgress(taskId, 0f, 0f, 0f, DownloadStatus.FAILED, "Failed to download theme file")
+
+            if (!themeResult.success) {
+                updateProgress(taskId, 0f, 0f, 0f, DownloadStatus.FAILED, themeResult.error)
                 return@flow
             }
-            
-            // 2. 下载预览图
+
+            // 2. 下载预览图（非致命：失败仅记录并跳过，不阻断主题安装）
             val previewFile = getPreviewImagePath(theme.author, theme.name)
             emit(DownloadProgress(
                 themeId = taskId,
@@ -213,8 +214,8 @@ class ThemeDownloader(private val context: Context) {
                 status = DownloadStatus.DOWNLOADING,
                 errorMessage = null
             ))
-            
-            val imageSuccess = downloadFileWithRetry(
+
+            val imageResult = downloadFileWithRetry(
                 url = theme.previewUrl,
                 file = previewFile,
                 taskId = taskId,
@@ -224,13 +225,14 @@ class ThemeDownloader(private val context: Context) {
                 val overall = 0.7f + (imageProgress * 0.3f)
                 updateProgress(taskId, 1f, imageProgress, overall, DownloadStatus.DOWNLOADING, null)
             }
-            
-            if (!imageSuccess) {
-                updateProgress(taskId, 1f, 0f, 0.7f, DownloadStatus.FAILED, "Failed to download preview image")
-                return@flow
+
+            if (!imageResult.success) {
+                // 预览图下载失败：删除可能残留的不完整文件，记录警告，但主题仍算成功
+                Log.w(TAG, "Preview image download skipped for theme ${theme.id}: ${imageResult.error}")
+                if (previewFile.exists()) previewFile.delete()
             }
-            
-            // 3. 下载完成
+
+            // 3. 下载完成（预览图缺失不影响主题可用）
             updateProgress(taskId, 1f, 1f, 1f, DownloadStatus.COMPLETED, null)
             
             // 4. 保存主题元数据 JSON
@@ -244,12 +246,29 @@ class ThemeDownloader(private val context: Context) {
             
         } catch (e: Exception) {
             Log.e(TAG, "Download failed for theme ${theme.id}", e)
-            updateProgress(taskId, 0f, 0f, 0f, DownloadStatus.FAILED, e.message ?: "Unknown error")
+            updateProgress(taskId, 0f, 0f, 0f, DownloadStatus.FAILED, describeException(e))
             downloadTasks.remove(taskId)
         } finally {
             downloadSemaphore.release()
         }
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * 把异常转换为有意义的、非 null 的错误描述。
+     * 优先用异常自带的 message，否则回退到异常类型名。
+     */
+    private fun describeException(e: Throwable): String {
+        val msg = e.message
+        return if (!msg.isNullOrBlank()) msg else (e::class.simpleName ?: "Unknown error")
+    }
+
+    /**
+     * 单个文件下载结果。失败时 [error] 始终为非空、有意义的描述。
+     */
+    private data class DownloadFileResult(
+        val success: Boolean,
+        val error: String? = null
+    )
 
     /**
      * 下载文件（支持断点续传）
@@ -260,15 +279,20 @@ class ThemeDownloader(private val context: Context) {
         taskId: String,
         isThemeFile: Boolean,
         onProgress: (Float) -> Unit
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): DownloadFileResult = withContext(Dispatchers.IO) {
+        // 空/无效 URL 早期校验，避免 OkHttp 抛出无 message 的 IllegalArgumentException
+        if (url.isBlank()) {
+            return@withContext DownloadFileResult(false, "Invalid download URL")
+        }
+
         var retryCount = 0
-        var lastError: String? = null
-        
+        var lastError: String = "Unknown error"
+
         while (retryCount < MAX_RETRIES) {
             try {
                 // 获取已下载的字节数（断点续传）
                 val downloadedBytes = if (file.exists()) file.length() else 0L
-                
+
                 // 构建请求
                 val request = Request.Builder()
                     .url(url)
@@ -278,31 +302,31 @@ class ThemeDownloader(private val context: Context) {
                         }
                     }
                     .build()
-                
+
                 val response = client.newCall(request).execute()
-                
+
                 // 处理响应
                 if (response.code !in 200..299) {
                     throw IOException("HTTP error: ${response.code}")
                 }
-                
+
                 val totalBytes = if (response.body?.contentLength() ?: -1L > 0) {
                     downloadedBytes + (response.body?.contentLength() ?: 0L)
                 } else {
                     -1L
                 }
-                
+
                 // 写入文件
                 FileOutputStream(file, downloadedBytes > 0).use { output ->
                     response.body?.byteStream()?.use { input ->
                         val buffer = ByteArray(BUFFER_SIZE)
                         var bytesRead: Long = 0
-                        
+
                         var read: Int
                         while (input.read(buffer).also { read = it } != -1) {
                             output.write(buffer, 0, read)
                             bytesRead += read
-                            
+
                             // 计算进度
                             val progress = if (totalBytes > 0) {
                                 (downloadedBytes + bytesRead).toFloat() / totalBytes
@@ -310,9 +334,9 @@ class ThemeDownloader(private val context: Context) {
                                 // 未知总大小时，使用已下载字节数估算
                                 0.9f // 暂时显示 90%
                             }
-                            
+
                             onProgress(progress.coerceIn(0f, 1f))
-                            
+
                             // 检查是否被取消
                             if (downloadTasks[taskId]?.isCancelled == true) {
                                 throw IOException("Download cancelled")
@@ -320,24 +344,24 @@ class ThemeDownloader(private val context: Context) {
                         }
                     }
                 }
-                
+
                 Log.d(TAG, "Download completed: ${file.absolutePath}")
-                return@withContext true
-                
+                return@withContext DownloadFileResult(true)
+
             } catch (e: Exception) {
-                lastError = e.message ?: "Unknown error"
+                lastError = describeException(e)
                 Log.w(TAG, "Download attempt ${retryCount + 1} failed: $lastError")
                 retryCount++
-                
+
                 if (retryCount < MAX_RETRIES) {
                     // 等待后重试
                     kotlinx.coroutines.delay(RETRY_DELAY_MS)
                 }
             }
         }
-        
+
         Log.e(TAG, "Download failed after $MAX_RETRIES retries: $lastError")
-        false
+        DownloadFileResult(false, lastError)
     }
 
     /**
