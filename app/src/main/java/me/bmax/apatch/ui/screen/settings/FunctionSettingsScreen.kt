@@ -202,7 +202,9 @@ fun FunctionSettingsScreen(navigator: DestinationsNavigator, highlightKey: Strin
                 .drop(1)
                 .debounce(1000L)
                 .collect { paths ->
-                    UmountConfigManager.saveConfig(context, UmountConfig(enabled = isUmountEnabled, paths = paths))
+                    withContext(Dispatchers.IO) {
+                        UmountConfigManager.saveConfig(context, UmountConfig(enabled = isUmountEnabled, paths = paths))
+                    }
                 }
         }
     }
